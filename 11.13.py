@@ -7,67 +7,6 @@ import backtrader as bt
 import pandas as pd
 from datetime import datetime
 import sys
-# class TestStrategy(bt.Strategy):
-#     params = (
-#         ('maperiod', 15),
-#     )
-
-#     def log(self, txt, dt=None):
-#         dt = dt or self.datas[0].datetime.datetime(0)
-#         print('%s, %s' % (dt.isoformat(), txt))
-
-#     def __init__(self):
-#         self.dataclose = self.datas[0].close
-#         self.order = None
-#         self.buyprice = None
-#         self.buycomm = None
-#         self.sma = bt.indicators.SimpleMovingAverage(
-#             self.datas[0], period=self.params.maperiod)
-
-#     def notify_order(self, order):
-#         if order.status in [order.Submitted, order.Accepted]:
-#             return
-
-#         if order.status in [order.Completed]:
-#             if order.isbuy():
-#                 self.log('BUY EXECUTED, Price: %.3f, Cost: %.3f, Comm %.3f' %
-#                          (order.executed.price,
-#                           order.executed.value,
-#                           order.executed.comm))
-#                 self.buyprice = order.executed.price
-#                 self.buycomm = order.executed.comm
-#             else:
-#                 self.log('SELL EXECUTED, Price: %.3f, Cost: %.3f, Comm %.3f' %
-#                          (order.executed.price,
-#                           order.executed.value,
-#                           order.executed.comm))
-#             self.bar_executed = len(self)
-
-#         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-#             self.log('Order Canceled/Margin/Rejected')
-
-#         self.order = None
-
-#     def notify_trade(self, trade):
-#         if not trade.isclosed:
-#             return
-#         self.log('OPERATION PROFIT, GROSS %.3f, NET %.3f' %
-#                  (trade.pnl, trade.pnlcomm))
-#     def next(self):
-#         self.log('Close, %.3f' % self.dataclose[0])
-
-#         if self.order:
-#             return
-
-#         if not self.position:
-#             if self.dataclose[0] < self.dataclose[-1]:
-#                 if self.dataclose[-1] < self.dataclose[-2]:
-#                     self.log('BUY CREATE, %.3f' % self.dataclose[0])
-#                     self.order = self.buy()
-#         else:
-#             if len(self) >= (self.bar_executed + 10):
-#                 self.log('SELL CREATE, %.3f' % self.dataclose[0])
-#                 self.order = self.sell()
 
 class GridStrategy(bt.Strategy):
     params = (
@@ -79,82 +18,85 @@ class GridStrategy(bt.Strategy):
 
     def log(self, txt, dt=None):
         dt = dt or self.datas[0].datetime.datetime(0)
-        print('%s, %s' % (dt.isoformat(), txt))
+        print('%s, %s  position.size=%d !!' % (dt.isoformat(), txt,self.position.size))
+
+
 
     def __init__(self):
         self.dataclose = self.datas[0].close
+        self.dataopen = self.datas[0].open  # 新增：获取开盘价
         self.order = None
         self.base_price = None
         self.grid_prices = []
         self.active_grids = set()
         self.total_commission = 0.0
+        self.last_trading_day = None  # 记录上一个交易日
 
-    def nextstart(self):
-        if self.base_price is None:
-            self.base_price = float(self.dataclose[0])
+    # def nextstart(self):
+    #     if self.base_price is None:
+    #         self.base_price = float(self.dataclose[0])
+    #         self.grid_prices = []
+
+    #         if self.p.grid_type == 'percentage':
+    #             interval = self.p.grid_interval  # 如 0.005 表示 0.5%
+    #             for i in range(-self.p.grid_levels, self.p.grid_levels + 1):
+    #                 price = self.base_price * (1 + i * interval)
+    #                 self.grid_prices.append(price)
+    #         elif self.p.grid_type == 'absolute':
+    #             interval = self.p.grid_interval  # 如 0.01 元
+    #             for i in range(-self.p.grid_levels, self.p.grid_levels + 1):
+    #                 price = self.base_price + i * interval
+    #                 self.grid_prices.append(price)
+    #         else:
+    #             raise ValueError("grid_type must be 'absolute' or 'percentage'")
+
+    #         print(f"Initial grid prices: {self.grid_prices}")
+
+    #         self.grid_prices.sort()
+    #         self.log(
+    #             f"Grid initialized. Base={self.base_price:.6f}, "
+    #             f"Type={self.p.grid_type}, Interval={self.p.grid_interval}, "
+    #             f"Levels=±{self.p.grid_levels}"
+    #        )
+    #交易策略：
+    def next(self):
+        if self.order:
+            return
+
+        current_datetime = self.datas[0].datetime.datetime(0)
+        current_date = current_datetime.date()
+
+        # 判断是否是新的一天（且是当天的第一根K线）
+        if self.last_trading_day != current_date:
+            # 是新一天：重置网格
+            self.last_trading_day = current_date
+            self.base_price = float(self.dataopen[0])  # 使用当日开盘价作为新基准
+
+            # 重新生成网格
             self.grid_prices = []
-
             if self.p.grid_type == 'percentage':
-                interval = self.p.grid_interval  # 如 0.005 表示 0.5%
+                interval = self.p.grid_interval
                 for i in range(-self.p.grid_levels, self.p.grid_levels + 1):
                     price = self.base_price * (1 + i * interval)
                     self.grid_prices.append(price)
             elif self.p.grid_type == 'absolute':
-                interval = self.p.grid_interval  # 如 0.01 元
+                interval = self.p.grid_interval
                 for i in range(-self.p.grid_levels, self.p.grid_levels + 1):
                     price = self.base_price + i * interval
                     self.grid_prices.append(price)
             else:
                 raise ValueError("grid_type must be 'absolute' or 'percentage'")
 
-            print(f"Initial grid prices: {self.grid_prices}")
-
             self.grid_prices.sort()
+            self.active_grids.clear()  # 可选：清空已触发的网格记录
+
             self.log(
-                f"Grid initialized. Base={self.base_price:.6f}, "
-                f"Type={self.p.grid_type}, Interval={self.p.grid_interval}, "
-                f"Levels=±{self.p.grid_levels}"
+                f"New day grid initialized. Date={current_date}, "
+                f"Base={self.base_price:.6f}, Type={self.p.grid_type}, "
+                f"Interval={self.p.grid_interval}, Levels=±{self.p.grid_levels}"
             )
 
-    # def next(self):
-    #     if self.order:
-    #         return
-
-    #     current_price = float(self.dataclose[0])
-
-    #     for price in self.grid_prices:
-    #         # 使用四舍五入避免浮点误差（保留6位足够）
-    #         key = round(price, 3)
-    #         if key not in self.active_grids:
-    #             # 判断是否“穿过”该网格（简单起见：只要达到就算）
-    #             if self.p.grid_type == 'absolute':
-    #                 tolerance = self.p.grid_interval * 0.1  # 容忍微小误差
-    #             else:
-    #                 tolerance = abs(self.base_price * self.p.grid_interval * 0.1)
-
-    #             if abs(current_price - price) <= tolerance or \
-    #                (len(self) > 1 and 
-    #                 (self.dataclose[-1] < price <= current_price or 
-    #                  self.dataclose[-1] > price >= current_price)):
-    #                 # 触发网格
-    #                 self.active_grids.add(key)
-
-    #                 if price > self.base_price:
-    #                     if self.position:
-    #                         self.log(f'SELL at grid {price:.6f} (current={current_price:.6f})')
-    #                         self.order = self.sell(size=self.p.stake)
-    #                     else:
-    #                         self.log(f'SKIP SELL (no position) at {price:.6f}')
-    #                 elif price < self.base_price:
-    #                     self.log(f'BUY at grid {price:.6f} (current={current_price:.6f})')
-    #                     self.order = self.buy(size=self.p.stake)
-    #                 # price == base_price: 忽略（或可作为初始仓位）
-
-    #交易策略：
-    def next(self):
-        if self.order:
-            return
-
+        # 原有的网格交易逻辑（保持不变）
         current_price = float(self.dataclose[0])
         candidate_grids = []
 
@@ -163,7 +105,6 @@ class GridStrategy(bt.Strategy):
             if key in self.active_grids:
                 continue
 
-            # 判断是否穿过，可触发
             if self.p.grid_type == 'absolute':
                 tolerance = self.p.grid_interval * 0.1
             else:
@@ -173,16 +114,14 @@ class GridStrategy(bt.Strategy):
             if abs(current_price - price) <= tolerance:
                 crossed = True
             elif len(self) > 1:
-                if (self.dataclose[-1] < price <= current_price) or \
-                (self.dataclose[-1] > price >= current_price):
+                prev_close = float(self.dataclose[-1])
+                if (prev_close < price <= current_price) or (prev_close > price >= current_price):
                     crossed = True
 
             if crossed:
                 candidate_grids.append(price)
 
-        # 只触发距离当前价最近的那个网格
         if candidate_grids:
-            # 按距离当前价的绝对值升序排列
             candidate_grids.sort(key=lambda p: abs(current_price - p))
             best_price = candidate_grids[0]
             key = round(best_price, 3)
@@ -221,7 +160,7 @@ class GridStrategy(bt.Strategy):
 if __name__ == '__main__':
     cerebro = bt.Cerebro()
     #cerebro.addstrategy(TestStrategy)
-    cerebro.addstrategy(GridStrategy,grid_type='absolute',grid_interval=0.004,grid_levels=10,stake=800)
+    cerebro.addstrategy(GridStrategy,grid_type='absolute',grid_interval=0.0004,grid_levels=10,stake=1500)
 
     modpath = os.path.dirname(os.path.abspath(sys.argv[0]))
     datapath = os.path.join(modpath, '../../datas/orcl-1995-2014.txt')
@@ -242,8 +181,8 @@ if __name__ == '__main__':
         low='low',
         close='close',
         volume='vol',
-        fromdate=datetime(2025, 11, 11),
-        todate=datetime(2025, 11, 12),
+        fromdate=datetime(2025, 8, 5),
+        todate=datetime(2025, 11, 10),
             timeframe=bt.TimeFrame.Minutes,  # 指定时间框架为分钟
         compression=1  # 1分钟线    
     )
