@@ -2,7 +2,10 @@ import struct
 from datetime import datetime, timedelta
 import csv
 
-csv_file_path = "my513300.csv"
+
+lc1_file_in = "sh511700场内货币.lc1"
+
+csv_file_path = "sh511700场内货币.csv"
 def read_lc1_file(file_path):
     # 打开lc1文件
     with open(file_path, "rb") as ofile:
@@ -72,6 +75,6 @@ def write_to_csv(kline_data, cols, csv_file_path):
         for kline in kline_data:
             writer.writerow(kline)
 
-kline_data, cols = read_lc1_file("E:\\new_tdx\\vipdoc\\sh\\minline\\sh513300.lc1")
+kline_data, cols = read_lc1_file(lc1_file_in)
 write_to_csv(kline_data, cols, csv_file_path)
 print(f"数据已写入 {csv_file_path}")
