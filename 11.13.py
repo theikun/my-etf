@@ -21,7 +21,7 @@ class AdvancedGridStrategy(bt.Strategy):
         ('atr_period', 14),       # ATR计算周期
         ('atr_dist_factor', 1.0), # 网格间距倍数 (1.0 表示 1倍ATR)
         ('trend_period', 200),    # 趋势线周期 (SMA200)
-        ('qty_per_grid', 10),     # 每一格买入的数量
+        ('qty_per_grid', 1500),     # 每一格买入的数量
         ('max_grids', 10),        # 最大允许持有的网格层数 (风控)
         ('print_log', True),      # 是否打印日志
     )
@@ -225,6 +225,135 @@ class RSI_EMA_IntradayStrategy(bt.Strategy):
                 print("sell signal")
                 self.order = self.close()
 
+    params = (
+        ('period', 20),      # 布林带周期 (通常为20)
+        ('devfactor', 2.0),  # 标准差倍数 (通常为2.0)
+        ('printlog', True),  # 是否打印日志
+    )
+
+    def log(self, txt, dt=None):
+        ''' 日志函数 '''
+        if self.params.printlog:
+            dt = dt or self.datas[0].datetime.date(0)
+            print(f'{dt.isoformat()}, {txt}')
+
+    def __init__(self):
+        self.dataclose = self.datas[0].close
+        self.order = None # 记录订单状态
+
+        # 初始化布林带指标
+        # 包含三条线: mid (中轨), top (上轨), bot (下轨)
+        self.bband = bt.indicators.BollingerBands(
+            self.datas[0], 
+            period=self.params.period, 
+            devfactor=self.params.devfactor
+        )
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        # 检查订单是否完成
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.log(f'买单执行: 价格 {order.executed.price:.2f}, 成本 {order.executed.value:.2f}, 手续费 {order.executed.comm:.2f}')
+            elif order.issell():
+                self.log(f'卖单执行: 价格 {order.executed.price:.2f}, 成本 {order.executed.value:.2f}, 手续费 {order.executed.comm:.2f}')
+            self.bar_executed = len(self)
+
+        self.order = None
+
+    def next(self):
+        # 如果有订单正在挂起，不进行操作
+        if self.order:
+            return
+
+        # --- 核心交易逻辑 ---
+        
+        # 1. 如果当前没有持仓
+        if not self.position:
+            # 买入信号: 收盘价跌破布林带下轨
+            if self.dataclose[0] < self.bband.lines.bot[0]:
+                self.log(f'信号触发: 收盘价 {self.dataclose[0]:.2f} < 下轨 {self.bband.lines.bot[0]:.2f} -> 买入')
+                # 全仓买入 (根据下面 sizer 设置)
+                self.order = self.buy()
+
+        # 2. 如果当前持有持仓
+        else:
+            # 平仓信号: 价格回归均值 (突破中轨)
+            # 也可以改为 > self.bband.lines.top[0] (触及上轨才卖，利润大但风险高)
+            if self.dataclose[0] > self.bband.lines.mid[0]:
+                self.log(f'信号触发: 收盘价 {self.dataclose[0]:.2f} > 中轨 {self.bband.lines.mid[0]:.2f} -> 平仓')
+                self.order = self.close()
+
+class DCAWithDipDoubling(bt.Strategy):
+    # 定义策略参数
+    params = (
+        ('stake', 100),       # 基础定投股数 (即用户说的 'x 股')
+    )
+
+    def log(self, txt, dt=None):
+        ''' 日志记录函数 '''
+        dt = dt or self.datas[0].datetime.date(0)
+        print(f'{dt.isoformat()}, {txt}')
+
+    def __init__(self):
+        self.dataclose = self.datas[0].close
+        self.order = None               # 跟踪订单状态
+        self.investment_stopped = False # 标记资金是否已用完
+
+    def notify_order(self, order):
+        ''' 订单状态通知 '''
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.log(f'买入执行: 价格: {order.executed.price:.2f}, 数量: {order.executed.size}, 剩余现金: {self.broker.getcash():.2f}')
+        
+        # 特别处理资金不足的Rejected订单，标记停止定投
+        elif order.status == order.Rejected and 'Margin' in str(order):
+            self.investment_stopped = True
+            self.log('!!! 订单因资金不足被拒绝。停止后续定投 !!!')
+
+        elif order.status in [order.Canceled, order.Rejected]:
+            self.log('订单取消/拒绝')
+
+        self.order = None
+
+    def next(self):
+        ''' 核心策略逻辑，每天（每个Bar）运行一次 '''
+        
+        if self.order:
+            return
+        
+        if self.investment_stopped:
+            return # 资金已用完，停止所有操作
+
+        current_price = self.dataclose[0]
+        
+        # 1. 判断买入股数
+        if self.dataclose[0] < self.dataclose[-1]:
+            # 当天股价下跌，买入 2*x 股
+            buy_size = self.p.stake * 2
+            action = '下跌加倍定投 (2x)'
+        else:
+            # 股价持平或上涨，买入 x 股
+            buy_size = self.p.stake
+            action = '常规定投 (x)'
+
+        required_cash = current_price * buy_size * (1 + self.broker.getcommission(self.data))
+        
+        # 2. 检查资金是否足够
+        if self.broker.getcash() < required_cash:
+            self.investment_stopped = True
+            self.log(f'!!! 现金不足以买入 {buy_size} 股，定投停止。剩余现金: {self.broker.getcash():.2f}')
+            return
+            
+        # 3. 执行买入
+        self.log(f'信号: {action}，准备买入 {buy_size} 股')
+        # 使用 bt.Order.Close 确保以今天的收盘价成交
+        self.order = self.buy(size=buy_size, exectype=bt.Order.Close)
 if __name__ == '__main__':
     cerebro = bt.Cerebro()
     #cerebro.addstrategy(TestStrategy)
@@ -232,10 +361,12 @@ if __name__ == '__main__':
     #cerebro.addstrategy(ATRChannelBreakout, atr_period=5, channel_period=20, atr_mult=2.0, printlog=True)
     #RSI_EMA_IntradayStrategy
     #cerebro.addstrategy(RSI_EMA_IntradayStrategy, rsi_period=14,ema_period=50,order_percent=0.95,rsi_low=30,rsi_high=70,printlog=True)
-    cerebro.addstrategy(AdvancedGridStrategy, 
-                            atr_period=14, 
-                            atr_dist_factor=1.5, # 1.5倍ATR作为间距
-                            max_grids=20)        # 最多持仓20层
+    # cerebro.addstrategy(AdvancedGridStrategy, 
+    #                         atr_period=14, 
+    #                         atr_dist_factor=1.5, # 1.5倍ATR作为间距
+    #                         max_grids=20)        # 最多持仓20层
+    cerebro.addstrategy(DCAWithDipDoubling, stake=1000) # 基础份额设置为 50 股
+
     modpath = os.path.dirname(os.path.abspath(sys.argv[0]))
     datapath = os.path.join(modpath, '../../datas/orcl-1995-2014.txt')
            #######
