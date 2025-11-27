@@ -286,74 +286,93 @@ class RSI_EMA_IntradayStrategy(bt.Strategy):
                 self.log(f'信号触发: 收盘价 {self.dataclose[0]:.2f} > 中轨 {self.bband.lines.mid[0]:.2f} -> 平仓')
                 self.order = self.close()
 
-class DCAWithDipDoubling(bt.Strategy):
-    # 定义策略参数
+class DailyDipDCA(bt.Strategy):
     params = (
-        ('stake', 100),       # 基础定投股数 (即用户说的 'x 股')
+        ('base_amount', 1000.0),   # 每日基础定投金额 (现金)
+        ('dip_multiplier', 2.0),   # 下跌时的加倍系数
+        ('print_log', True),       # 是否打印日志
     )
 
     def log(self, txt, dt=None):
-        ''' 日志记录函数 '''
-        dt = dt or self.datas[0].datetime.date(0)
-        print(f'{dt.isoformat()}, {txt}')
+        ''' 简单的日志记录函数 '''
+        if self.params.print_log:
+            dt = dt or self.datas[0].datetime.date(0)
+            print(f'{dt.isoformat()}, {txt}')
 
     def __init__(self):
+        # 引用收盘价数据
         self.dataclose = self.datas[0].close
-        self.order = None               # 跟踪订单状态
-        self.investment_stopped = False # 标记资金是否已用完
+        self.order = None
+        self.total_invested = 0  # 记录总投入本金
 
     def notify_order(self, order):
-        ''' 订单状态通知 '''
         if order.status in [order.Submitted, order.Accepted]:
             return
 
         if order.status in [order.Completed]:
             if order.isbuy():
-                self.log(f'买入执行: 价格: {order.executed.price:.2f}, 数量: {order.executed.size}, 剩余现金: {self.broker.getcash():.2f}')
-        
-        # 特别处理资金不足的Rejected订单，标记停止定投
-        elif order.status == order.Rejected and 'Margin' in str(order):
-            self.investment_stopped = True
-            self.log('!!! 订单因资金不足被拒绝。停止后续定投 !!!')
+                self.log(f'买入执行: 价格: {order.executed.price:.2f}, '
+                         f'数量: {order.executed.size:.4f}, '
+                         f'金额: {order.executed.value:.2f}, '
+                         f'手续费: {order.executed.comm:.2f}')
+            elif order.issell():
+                self.log(f'卖出执行: 价格: {order.executed.price:.2f}')
 
-        elif order.status in [order.Canceled, order.Rejected]:
-            self.log('订单取消/拒绝')
+            self.bar_executed = len(self)
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.log('订单被取消/资金不足/拒绝')
 
         self.order = None
 
     def next(self):
-        ''' 核心策略逻辑，每天（每个Bar）运行一次 '''
-        
+        # 检查是否有未完成的订单
         if self.order:
             return
-        
-        if self.investment_stopped:
-            return # 资金已用完，停止所有操作
 
-        current_price = self.dataclose[0]
-        
-        # 1. 判断买入股数
-        if self.dataclose[0] < self.dataclose[-1]:
-            # 当天股价下跌，买入 2*x 股
-            buy_size = self.p.stake * 2
-            action = '下跌加倍定投 (2x)'
-        else:
-            # 股价持平或上涨，买入 x 股
-            buy_size = self.p.stake
-            action = '常规定投 (x)'
-
-        required_cash = current_price * buy_size * (1 + self.broker.getcommission(self.data))
-        
-        # 2. 检查资金是否足够
-        if self.broker.getcash() < required_cash:
-            self.investment_stopped = True
-            self.log(f'!!! 现金不足以买入 {buy_size} 股，定投停止。剩余现金: {self.broker.getcash():.2f}')
+        # 确保有前一天的数据进行比较
+        if len(self) < 2:
             return
+
+        # 1. 获取当前账户现金
+        cash = self.broker.get_cash()
+
+        # 2. 判断是否下跌 (今日收盘 < 昨日收盘)
+        # 注意：backtrader中 [0] 是当前，[-1] 是上一根K线
+        today_close = self.dataclose[0]
+        prev_close = self.dataclose[-1]
+        
+        amount_to_invest = self.params.base_amount
+
+        if today_close < prev_close:
+            amount_to_invest *= self.params.dip_multiplier
+            condition = "下跌 (加倍定投)"
+        else:
+            condition = "上涨/平盘 (正常定投)"
+
+        # 3. 检查现金是否足够
+        if cash >= amount_to_invest:
+            # 计算购买数量 = 投资金额 / 当前价格
+            # 注意：这里简单按收盘价计算，实际成交价可能是次日开盘价
+            size = amount_to_invest / today_close
             
-        # 3. 执行买入
-        self.log(f'信号: {action}，准备买入 {buy_size} 股')
-        # 使用 bt.Order.Close 确保以今天的收盘价成交
-        self.order = self.buy(size=buy_size, exectype=bt.Order.Close)
+            self.log(f'信号触发: {condition}, 目标金额: {amount_to_invest:.2f}, 当前价: {today_close:.2f}')
+            
+            # 下单买入
+            self.order = self.buy(size=size)
+            self.total_invested += amount_to_invest
+        else:
+            self.log(f'资金不足，无法定投。剩余现金: {cash:.2f}')
+
+    def stop(self):
+        # 策略结束时打印总结
+        value = self.broker.getvalue()
+        pnl = value - self.broker.startingcash
+        #self.log(f'--- 策略结束 ---', dt=datetime.date.today())
+        self.log(f'总投入本金 (估算): {self.total_invested:.2f}')
+        self.log(f'最终账户总值: {value:.2f}')
+        self.log(f'总盈亏: {pnl:.2f}')
+
 if __name__ == '__main__':
     cerebro = bt.Cerebro()
     #cerebro.addstrategy(TestStrategy)
@@ -365,13 +384,13 @@ if __name__ == '__main__':
     #                         atr_period=14, 
     #                         atr_dist_factor=1.5, # 1.5倍ATR作为间距
     #                         max_grids=20)        # 最多持仓20层
-    cerebro.addstrategy(DCAWithDipDoubling, stake=1000) # 基础份额设置为 50 股
+    cerebro.addstrategy(DailyDipDCA, base_amount=45.0, dip_multiplier=2.0)
 
     modpath = os.path.dirname(os.path.abspath(sys.argv[0]))
     datapath = os.path.join(modpath, '../../datas/orcl-1995-2014.txt')
            #######
-    df = pd.read_excel('sh513310.xlsx')
-    #df = pd.read_excel('sh511700场内货币.xlsx')
+    #df = pd.read_excel('sh513310.xlsx')
+    df = pd.read_excel('sh511700场内货币.xlsx')
     df['datetime'] = pd.to_datetime(
     df['date'].dt.strftime('%Y-%m-%d') + ' ' + df['time'].astype(str)
     )
